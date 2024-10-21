@@ -18,7 +18,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	oidc "github.com/coreos/go-oidc/v3/oidc"
@@ -26,6 +28,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/headlamp-k8s/headlamp/backend/pkg/cache"
 	"github.com/headlamp-k8s/headlamp/backend/pkg/helm"
 	"github.com/headlamp-k8s/headlamp/backend/pkg/kubeconfig"
@@ -33,7 +36,10 @@ import (
 	"github.com/headlamp-k8s/headlamp/backend/pkg/plugins"
 	"github.com/headlamp-k8s/headlamp/backend/pkg/portforward"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 
@@ -1583,6 +1589,240 @@ func (c *HeadlampConfig) renameCluster(w http.ResponseWriter, r *http.Request) {
 	c.getConfig(w, r)
 }
 
+// ----- Code for Handing Websocket Connection ----- //
+
+type clusterConnection struct {
+	ClientSet     *kubernetes.Clientset
+	DynamicClient dynamic.Interface
+	LastUse       time.Time
+	FrontendConns map[*websocket.Conn]bool
+	Mutex         sync.Mutex
+}
+
+var (
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for now
+		},
+	}
+	clusterConnections = make(map[string]*clusterConnection)
+	connectionsMutex   = &sync.Mutex{}
+)
+
+func (c *HeadlampConfig) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logger.Log(logger.LevelError, nil, err, "Failed to upgrade connection to WebSocket")
+		return
+	}
+
+	defer conn.Close()
+
+	for {
+		_, message, err := conn.ReadMessage()
+		// TODO: Handle retry logic
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				logger.Log(logger.LevelError, nil, err, "Unexpected close error")
+			}
+
+			break
+		}
+
+		if err := c.handleMessage(conn, message); err != nil {
+			logger.Log(logger.LevelError, nil, err, "Failed to handle message")
+		}
+	}
+}
+
+func (c *HeadlampConfig) handleMessage(frontendConn *websocket.Conn, message []byte) error {
+	var msg struct {
+		ClusterName string `json:"clusterName"`
+		Path        string `json:"path"`
+	}
+
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return err
+	}
+
+	return c.watchResource(msg.ClusterName, msg.Path, frontendConn)
+}
+
+func (c *HeadlampConfig) watchResource(clusterName, path string, frontendConn *websocket.Conn) error {
+	connectionsMutex.Lock()
+	clusterConn, exists := clusterConnections[clusterName]
+	if !exists {
+		config, err := c.getClusterConfig(clusterName)
+		if err != nil {
+			connectionsMutex.Unlock()
+			return err
+		}
+
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			connectionsMutex.Unlock()
+			return err
+		}
+
+		dynamicClient, err := dynamic.NewForConfig(config)
+		if err != nil {
+			connectionsMutex.Unlock()
+			return err
+		}
+
+		clusterConn = &clusterConnection{
+			ClientSet:     clientset,
+			DynamicClient: dynamicClient,
+			LastUse:       time.Now(),
+			FrontendConns: make(map[*websocket.Conn]bool),
+		}
+		clusterConnections[clusterName] = clusterConn
+	}
+	connectionsMutex.Unlock()
+
+	clusterConn.Mutex.Lock()
+	clusterConn.FrontendConns[frontendConn] = true
+	clusterConn.LastUse = time.Now()
+	clusterConn.Mutex.Unlock()
+
+	go c.streamResource(clusterConn, path, frontendConn)
+
+	return nil
+}
+
+func (c *HeadlampConfig) streamResource(clusterConn *clusterConnection, path string, frontendConn *websocket.Conn) {
+	parsedURL, err := url.Parse(path)
+	if err != nil {
+		logger.Log(logger.LevelError, nil, err, "Failed to parse resource path")
+		return
+	}
+
+	parts := strings.Split(strings.Trim(parsedURL.Path, "/"), "/")
+	if len(parts) < 2 {
+		logger.Log(logger.LevelError, nil, fmt.Errorf("invalid resource path"), "Invalid resource path")
+		return
+	}
+
+	var gvr schema.GroupVersionResource
+	var namespace string
+
+	switch parts[0] {
+	case "api":
+		// Core API
+		if len(parts) < 3 {
+			logger.Log(logger.LevelError, nil, fmt.Errorf("invalid core API path"), "Invalid core API path")
+			return
+		}
+		gvr = schema.GroupVersionResource{Group: "", Version: parts[1], Resource: parts[len(parts)-1]}
+		if len(parts) > 3 && parts[2] == "namespaces" {
+			namespace = parts[3]
+		}
+	case "apis":
+		// Named API groups
+		if len(parts) < 4 {
+			logger.Log(logger.LevelError, nil, fmt.Errorf("invalid API group path"), "Invalid API group path")
+			return
+		}
+		gvr = schema.GroupVersionResource{Group: parts[1], Version: parts[2], Resource: parts[len(parts)-1]}
+		if len(parts) > 4 && parts[3] == "namespaces" {
+			namespace = parts[4]
+		}
+	default:
+		logger.Log(logger.LevelError, nil, fmt.Errorf("unknown API prefix"), "Unknown API prefix")
+		return
+	}
+
+	fmt.Println("Debug: GVR =", gvr, "Namespace =", namespace)
+
+	listOptions := parsedURL.Query()
+
+	var resourceInterface dynamic.ResourceInterface
+	if namespace != "" {
+		resourceInterface = clusterConn.DynamicClient.Resource(gvr).Namespace(namespace)
+	} else {
+		resourceInterface = clusterConn.DynamicClient.Resource(gvr)
+	}
+
+	watcher, err := resourceInterface.Watch(context.Background(), v1.ListOptions{
+		Watch:           true,
+		ResourceVersion: listOptions.Get("resourceVersion"),
+		FieldSelector:   listOptions.Get("fieldSelector"),
+		LabelSelector:   listOptions.Get("labelSelector"),
+		Limit:           int64(parseLimit(listOptions.Get("limit"))),
+	})
+
+	if err != nil {
+		logger.Log(logger.LevelError, nil, err, "Failed to watch resource")
+		return
+	}
+	defer watcher.Stop()
+
+	for event := range watcher.ResultChan() {
+		resourceJSON, err := json.Marshal(event.Object)
+		if err != nil {
+			logger.Log(logger.LevelError, nil, err, "Failed to marshal resource event")
+			continue
+		}
+
+		clusterConn.Mutex.Lock()
+		if _, ok := clusterConn.FrontendConns[frontendConn]; ok {
+			err = frontendConn.WriteMessage(websocket.TextMessage, resourceJSON)
+			if err != nil {
+				logger.Log(logger.LevelError, nil, err, "Failed to send resource event to frontend")
+				delete(clusterConn.FrontendConns, frontendConn)
+			}
+		}
+		clusterConn.Mutex.Unlock()
+	}
+}
+
+func parseLimit(limitStr string) int64 {
+	if limitStr == "" {
+		return 0
+	}
+	limit, err := strconv.ParseInt(limitStr, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return limit
+}
+
+// getClusterConfig get's the cluserConfig
+func (c *HeadlampConfig) getClusterConfig(clusterName string) (*rest.Config, error) {
+	ctxtProxy, err := c.kubeConfigStore.GetContext(clusterName)
+	if err != nil {
+		logger.Log(logger.LevelError, map[string]string{"cluster": clusterName},
+			err, "getting context")
+		return nil, fmt.Errorf("cluster not found: %s", clusterName)
+	}
+
+	clientConfig, err := ctxtProxy.RESTConfig()
+	if err != nil {
+		logger.Log(logger.LevelError, map[string]string{"cluster": clusterName},
+			err, "getting client config")
+		return nil, fmt.Errorf("failed to get client config for cluster: %s", clusterName)
+	}
+
+	return clientConfig, nil
+}
+
+// cleanupUnusedConnections is used to clear un used connections from the list
+func (c *HeadlampConfig) cleanupUnusedConnections() {
+	for {
+		time.Sleep(5 * time.Minute)
+
+		connectionsMutex.Lock()
+		for key, conn := range clusterConnections {
+			conn.Mutex.Lock()
+			if time.Since(conn.LastUse) > 10*time.Minute && len(conn.FrontendConns) == 0 {
+				delete(clusterConnections, key)
+			}
+			conn.Mutex.Unlock()
+		}
+		connectionsMutex.Unlock()
+	}
+}
+
 func (c *HeadlampConfig) addClusterSetupRoute(r *mux.Router) {
 	// Do not add the route if dynamic clusters are disabled
 	if !c.enableDynamicClusters {
@@ -1599,6 +1839,12 @@ func (c *HeadlampConfig) addClusterSetupRoute(r *mux.Router) {
 
 	// Rename a cluster
 	r.HandleFunc("/cluster/{name}", c.renameCluster).Methods("PUT")
+
+	// Websocket connections
+	r.HandleFunc("/ws", c.handleWebSocket)
+
+	// Start the connection cleanup goroutine
+	go c.cleanupUnusedConnections()
 }
 
 /*
